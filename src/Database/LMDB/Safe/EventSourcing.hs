@@ -11,6 +11,7 @@
 module Database.LMDB.Safe.EventSourcing
   ( module Database.LMDB.Safe
   , withEventSource
+  , importEvents
   , EventId
   ) where
 
@@ -55,6 +56,34 @@ instance SafeCopy st => ToLMDB (StoredState st) where
 type EventSourceSchema ev st
   = DBDef "events" (Create :& IntegerKey) EventId (SafeCopyLMDB ev)
  :& DBDef "state"  Create                 ()      (StoredState st)
+
+-- It's faster to use MDB_APPEND when you want to import huge amount
+-- of events, hence I wrote this function. Generate proper events and
+-- import them in a transaction.
+importEvents :: (SafeCopy event, SafeCopy state)
+             => FilePath
+             -> [event]
+             -> state
+             -> IO ()
+importEvents path es state
+  = withLMDB
+      (Config path (5*1000*1000*1000) 2 [])
+      (Proxy :: Proxy (EventSourceSchema event state))
+      $ \tx (evDB :& stateDB) -> do
+          -- eid <- (tx ReadOnly $ lastEventId evDB) >>= \case
+          --   Left err      -> fail $ "Unexpected error from DB: " ++ show err
+          --   Right Nothing -> return $ EventId 0
+          --   Right (Just i) -> return i
+          ret <- tx ReadWrite
+                 $ forM_ (zip (iterate succEventId (EventId 0)) es)
+                     (\(ix, e) -> putWith mdbAppend evDB ix (SafeCopyLMDB e))
+          case ret of
+            Left err -> fail $ show err
+            Right r  -> return r
+          return ()
+  where
+    mdbAppend = compileWriteFlags [MDB_APPEND]
+
 
 withEventSource
   :: (SafeCopy event, SafeCopy state)
@@ -114,8 +143,6 @@ withEventSource path flags init step act
                   _ -> return ()
 
                 return ()
-
-
         in act pipe
 
 lastEventId :: DB EventId a -> Transaction ro (Maybe EventId)
